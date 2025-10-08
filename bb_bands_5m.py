@@ -29,11 +29,23 @@ except Exception:
     # 未安装或其它异常时忽略，仍可用系统环境变量
     pass
 
+def _getenv_strip(key: str, default: str = "") -> str:
+    """读取环境变量并去除首尾空白"""
+    val = os.getenv(key, default)
+    return val.strip() if isinstance(val, str) else val
+
 # ---------------- Config ----------------
-OKX_API_KEY = os.getenv('OKX_API_KEY', '')
-OKX_API_SECRET = os.getenv('OKX_API_SECRET', '')
-OKX_API_PASSPHRASE = os.getenv('OKX_API_PASSPHRASE', '')
-SANDBOX = os.getenv('SANDBOX', 'false').lower() in ('1', 'true', 'yes')
+OKX_API_KEY = _getenv_strip('OKX_API_KEY', '')
+OKX_API_SECRET = _getenv_strip('OKX_API_SECRET', '')
+OKX_API_PASSPHRASE = _getenv_strip('OKX_API_PASSPHRASE', '')
+SANDBOX = _getenv_strip('SANDBOX', 'false').lower() in ('1', 'true', 'yes')
+# 启动时仅打印是否存在，便于在 Railway Logs 排查；不打印真实值
+for _k in ('OKX_API_KEY', 'OKX_API_SECRET', 'OKX_API_PASSPHRASE', 'SANDBOX'):
+    try:
+        _present = bool(os.getenv(_k))
+        logger.info(f"{_k} present={_present}")
+    except Exception:
+        logger.info(f"{_k} present=False")
 
 TIMEFRAME = '5m'
 BB_PERIOD = 20
