@@ -1,0 +1,1 @@
+worker: python bb_bands_5m.py

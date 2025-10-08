@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+# bot_okx_macd_bb_hedge.py
+"""
+OKX 永续合约 5m MACD + Bollinger (双向持仓/Hedge) 自动策略
+- 环境变量:
+    OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE
+    SANDBOX (optional, 'true' to enable)
+- 核心币对 & 杠杆规则写在 DEFAULT_SYMBOLS
+"""
+
+import os
+import time
+import math
+import logging
+from typing import Dict, Any, Optional
+
+import ccxt
+import pandas as pd
+import numpy as np
+
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
+
+# ---------------- Config ----------------
+OKX_API_KEY = os.getenv('OKX_API_KEY', '')
+OKX_API_SECRET = os.getenv('OKX_API_SECRET', '')
+OKX_API_PASSPHRASE = os.getenv('OKX_API_PASSPHRASE', '')
+SANDBOX = os.getenv('SANDBOX', 'false').lower() in ('1', 'true', 'yes')
+
+TIMEFRAME = '5m'
+BB_PERIOD = 20
+BB_STD = 2
+MACD_FAST = 6
+MACD_SLOW = 16
+MACD_SIGNAL = 9
+SLEEP_SECONDS = 20  # loop sleep
+
+# your desired symbols (unified ccxt format)
+DEFAULT_SYMBOLS = ['FIL/USDT', 'ZRO/USDT', 'WIF/USDT', 'WLD/USDT']
+
+# leverage rules (symbol base name -> leverage)
+DEFAULT_LEVERAGES = {'ZRO': 20, 'default': 30}
+
+# trading mode: 'cross' or 'isolated'
+TD_MODE = os.getenv('TD_MODE', 'cross')
+
+# minimum USDT exposure per symbol (to avoid zero orders)
+MIN_USDT_PER_SYMBOL = 0.5  # still try for tiny balances
+
+# ---------------- Indicators ----------------
+def compute_macd(close: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    hist = macd - signal_line
+    return macd, signal_line, hist
+
+def compute_bollinger(close: pd.Series, period=20, std=2.0):
+    ma = close.rolling(window=period).mean()
+    sd = close.rolling(window=period).std()
+    upper = ma + (sd * std)
+    lower = ma - (sd * std)
+    return ma, upper, lower
+
+# ---------------- Exchange wrapper ----------------
+class OKXHedgeBot:
+    def __init__(self, symbols):
+        self.symbols = symbols
+        self.exchange = ccxt.okx({
+            'apiKey': OKX_API_KEY,
+            'secret': OKX_API_SECRET,
+            'password': OKX_API_PASSPHRASE,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'swap'}
+        })
+        if SANDBOX:
+            logger.warning("SANDBOX MODE ENABLED")
+            self.exchange.set_sandbox_mode(True)
+
+        # load markets
+        self.markets = self.exchange.load_markets(True)
+        # map symbol->market & instId
+        self.market_map = {}
+        for s in symbols:
+            m = self.markets.get(s)
+            if not m:
+                logger.error(f"Symbol {s} not in exchange.load_markets()")
+                raise ValueError(f"{s} not available")
+            inst = None
+            info = m.get('info', {})
+            inst = info.get('instId') or info.get('symbol') or m.get('id')
+            self.market_map[s] = {'market': m, 'instId': inst}
+        # prepare market info (min size, step)
+        self._prepare_market_infos()
+        # try to set position mode to hedge (OKX: dual/hedge)
+        self._ensure_hedge_mode()
+
+    def _prepare_market_infos(self):
+        for s, meta in self.market_map.items():
+            m = meta['market']
+            info = m.get('info', {}) or {}
+            min_sz = None
+            size_inc = None
+            tick = None
+            for key in ('minSz', 'min_size', 'min_size', 'minSize'):
+                if info.get(key) is not None:
+                    try:
+                        min_sz = float(info.get(key))
+                        break
+                    except Exception:
+                        pass
+            for key in ('lotSz', 'sizeIncrement', 'increment', 'size_step'):
+                if info.get(key) is not None:
+                    try:
+                        size_inc = float(info.get(key))
+                        break
+                    except Exception:
+                        pass
+            for key in ('tickSz', 'tickSize', 'priceIncrement', 'price_step'):
+                if info.get(key) is not None:
+                    try:
+                        tick = float(info.get(key))
+                        break
+                    except Exception:
+                        pass
+            if min_sz is None:
+                min_sz = m.get('limits', {}).get('amount', {}).get('min', 0.000001)
+            if size_inc is None:
+                size_inc = m.get('precision', {}).get('amount', 0.000001)
+            if tick is None:
+                tick = m.get('precision', {}).get('price', 0.01)
+            meta.update({'min_size': min_sz, 'size_increment': size_inc, 'tick': tick})
+            logger.info(f"{s} min_size={min_sz} size_inc={size_inc} tick={tick}")
+
+    def _ensure_hedge_mode(self):
+        """Try to set OKX to hedge/dual-mode (posMode = 'long_short_mode')"""
+        try:
+            # OKX endpoint may be account/position-mode or account/set-position-mode depending on wrapper
+            # We'll try common variants
+            params = {'posMode': 'long_short_mode'}
+            try:
+                resp = self.exchange.private_post_account_set_position_mode(params)
+                logger.info(f"Set position mode resp: {resp}")
+            except Exception:
+                try:
+                    resp = self.exchange.private_post_account_set_positionmode(params)
+                    logger.info(f"Set position mode resp alt: {resp}")
+                except Exception as e:
+                    logger.warning(f"Unable to set position mode via private_post. Error: {e}")
+            # Also try unified helper if exists
+            if hasattr(self.exchange, 'set_position_mode'):
+                try:
+                    self.exchange.set_position_mode(True)  # sometimes expects boolean
+                    logger.info("Called exchange.set_position_mode(True)")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.exception(f"Error ensuring hedge mode: {e}")
+
+    def fetch_balance_usdt(self) -> float:
+        try:
+            bal = self.exchange.fetch_balance()
+            usdt = 0.0
+            # unified dictionary
+            if 'USDT' in bal.get('free', {}):
+                usdt = float(bal['free'].get('USDT', 0) or 0)
+            else:
+                # fallback try different layouts
+                for k, v in (bal.get('total') or {}).items():
+                    if k.upper() == 'USDT':
+                        usdt = float(v or 0)
+                        break
+            return usdt
+        except Exception as e:
+            logger.exception(f"fetch_balance error: {e}")
+            return 0.0
+
+    def safe_amount(self, symbol: str, raw_amount: float) -> float:
+        meta = self.market_map[symbol]
+        step = meta.get('size_increment', 1e-6)
+        min_size = meta.get('min_size', 1e-6)
+        if raw_amount <= 0:
+            return 0.0
+        # compute precision digits
+        precision = 0
+        if step < 1:
+            precision = int(round(-math.log10(step)))
+        amount = float(round(raw_amount, precision))
+        if amount < min_size:
+            amount = min_size
+        return amount
+
+    def set_leverage_for_symbol(self, symbol: str, leverage: int):
+        instId = self.market_map[symbol]['instId']
+        try:
+            params = {'instId': instId, 'lever': str(leverage), 'mgnMode': 'cross'}
+            try:
+                resp = self.exchange.private_post_account_set_leverage(params)
+                logger.info(f"Set leverage {leverage} for {symbol} resp: {resp}")
+            except Exception:
+                # some wrappers use privatePostAccountSetLeverage
+                try:
+                    resp = self.exchange.privatePostAccountSetLeverage(params)
+                    logger.info(f"Set leverage alt {leverage} resp: {resp}")
+                except Exception as e:
+                    logger.warning(f"Could not set leverage via private endpoint: {e}")
+        except Exception as e:
+            logger.exception(f"set_leverage error: {e}")
+
+    def fetch_ohlcv_df(self, symbol: str, timeframe: str = TIMEFRAME, limit: int = 200) -> pd.DataFrame:
+        ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('datetime', inplace=True)
+        return df
+
+    def get_positions(self, symbol: str) -> Dict[str, float]:
+        """
+        Return dict: {'long': size_float, 'short': size_float}
+        sizes are absolute contract amounts (may be raw contract units)
+        """
+        res = {'long': 0.0, 'short': 0.0}
+        instId = self.market_map[symbol]['instId']
+        # try unified fetch positions
+        try:
+            if hasattr(self.exchange, 'fetch_positions'):
+                try:
+                    raw = self.exchange.fetch_positions([symbol])
+                    for p in raw:
+                        info = p.get('info', {})
+                        # adapt to structure: check posSide if exists
+                        pos_side = info.get('posSide') or info.get('side') or p.get('side')
+                        size = float(p.get('contracts') or p.get('positions') or p.get('amount') or 0)
+                        if pos_side:
+                            if pos_side.lower().startswith('long'):
+                                res['long'] += abs(size)
+                            elif pos_side.lower().startswith('short'):
+                                res['short'] += abs(size)
+                        else:
+                            # fallback: infer by sign
+                            try:
+                                if float(size) > 0:
+                                    res['long'] += abs(float(size))
+                            except Exception:
+                                pass
+                    return res
+                except Exception:
+                    pass
+
+            # fallback to raw private endpoint
+            try:
+                resp = None
+                try:
+                    resp = self.exchange.private_get_account_positions({'instId': instId})
+                except Exception:
+                    try:
+                        resp = self.exchange.privateGetAccountPositions({'instId': instId})
+                    except Exception:
+                        resp = None
+                if resp:
+                    data = resp.get('data') or resp
+                    if isinstance(data, list):
+                        for item in data:
+                            # item may have 'posSide' or 'side' and 'pos' or 'availPos'
+                            pside = item.get('posSide') or item.get('side') or ''
+                            qty = float(item.get('pos') or item.get('availPos') or item.get('position') or 0)
+                            if isinstance(pside, str) and pside.lower().startswith('long'):
+                                res['long'] += abs(qty)
+                            elif isinstance(pside, str) and pside.lower().startswith('short'):
+                                res['short'] += abs(qty)
+                    else:
+                        # single object
+                        pside = data.get('posSide') or data.get('side') or ''
+                        qty = float(data.get('pos') or data.get('availPos') or data.get('position') or 0)
+                        if pside.lower().startswith('long'):
+                            res['long'] += abs(qty)
+                        elif pside.lower().startswith('short'):
+                            res['short'] += abs(qty)
+                return res
+            except Exception as e:
+                logger.exception(f"get_positions fallback error: {e}")
+                return res
+        except Exception as e:
+            logger.exception(f"get_positions error: {e}")
+            return res
+
+    def create_market_order(self, symbol: str, side: str, pos_side: str, amount_usdt: float) -> Optional[Dict[str, Any]]:
+        """
+        side: 'buy' (open long) or 'sell' (open short)
+        pos_side: 'long' or 'short' (for hedge)
+        amount_usdt: funds to use (USDT)
+        """
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            price = float(ticker['last'])
+            if price <= 0:
+                logger.error("invalid price")
+                return None
+            leverage = DEFAULT_LEVERAGES.get(symbol.split('/')[0], DEFAULT_LEVERAGES['default'])
+            # compute contract qty approximate: (amount_usdt * leverage) / price
+            raw_qty = (amount_usdt * leverage) / price
+            qty = self.safe_amount(symbol, raw_qty)
+            if qty <= 0:
+                logger.warning("qty <= 0 after safe_amount")
+                return None
+            instId = self.market_map[symbol]['instId']
+            params = {'instId': instId, 'tdMode': TD_MODE, 'posSide': pos_side}
+            logger.info(f"Placing MARKET order: {symbol} side={side} posSide={pos_side} qty={qty} params={params}")
+            order = self.exchange.create_order(symbol, 'market', side, qty, None, params)
+            logger.info(f"create_order resp: {order}")
+            return order
+        except Exception as e:
+            logger.exception(f"create_market_order error: {e}")
+            return None
+
+    def close_side_position(self, symbol: str, pos_side: str) -> bool:
+        """
+        Close a single side by placing an opposite reduceOnly market order for that pos_side.
+        pos_side: 'long' or 'short' (the side to close)
+        """
+        try:
+            positions = self.get_positions(symbol)
+            size = positions.get(pos_side, 0.0)
+            if not size or size <= 0:
+                logger.info(f"No {pos_side} position to close on {symbol}")
+                return True
+            # To close long: place 'sell' with reduceOnly and posSide='long'
+            side = 'sell' if pos_side == 'long' else 'buy'
+            instId = self.market_map[symbol]['instId']
+            qty = self.safe_amount(symbol, size)
+            params = {'instId': instId, 'tdMode': TD_MODE, 'posSide': pos_side, 'reduceOnly': True}
+            logger.info(f"Closing {pos_side} on {symbol} via market {side} qty={qty} params={params}")
+            order = self.exchange.create_order(symbol, 'market', side, qty, None, params)
+            logger.info(f"close order resp: {order}")
+            return True
+        except Exception as e:
+            logger.exception(f"close_side_position error: {e}")
+            return False
+
+# ---------------- Strategy & Loop ----------------
+def check_signals_from_df(df: pd.DataFrame):
+    close = df['close']
+    macd, signal_line, hist = compute_macd(close, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    ma, bb_upper, bb_lower = compute_bollinger(close, BB_PERIOD, BB_STD)
+    i = -1
+    latest_macd = macd.iloc[i]
+    latest_signal = signal_line.iloc[i]
+    prev_macd = macd.iloc[i - 1]
+    prev_signal = signal_line.iloc[i - 1]
+    latest_close = close.iloc[i]
+    prev_close = close.iloc[i - 1]
+    latest_mid = ma.iloc[i]
+
+    macd_goldencross = (prev_macd < prev_signal) and (latest_macd > latest_signal)
+    macd_deathcross = (prev_macd > prev_signal) and (latest_macd < latest_signal)
+    cross_mid_up = (prev_close < ma.iloc[i - 1]) and (latest_close > latest_mid)
+    cross_mid_down = (prev_close > ma.iloc[i - 1]) and (latest_close < latest_mid)
+
+    return {
+        'long_entry': macd_goldencross and cross_mid_up,
+        'long_exit': macd_deathcross or (latest_close < latest_mid),
+        'short_entry': macd_deathcross and cross_mid_down,
+        'short_exit': macd_goldencross or (latest_close > latest_mid),
+        'latest_close': latest_close,
+        'mid': latest_mid
+    }
+
+def main_loop(symbols):
+    bot = OKXHedgeBot(symbols)
+    logger.info("Starting hedge bot main loop.")
+    while True:
+        try:
+            usdt_balance = bot.fetch_balance_usdt()
+            logger.info(f"Free USDT balance: {usdt_balance}")
+            n = len(symbols)
+            # equal split of free balance to each symbol
+            if usdt_balance <= 0:
+                logger.warning("USDT balance zero or cannot fetch. Sleeping.")
+                time.sleep(10)
+                continue
+            per_symbol_usdt = max(MIN_USDT_PER_SYMBOL, usdt_balance / n)
+            logger.info(f"Allocating {per_symbol_usdt} USDT per symbol (n={n})")
+
+            for sym in symbols:
+                try:
+                    # set leverage per symbol
+                    base = sym.split('/')[0]
+                    lev = DEFAULT_LEVERAGES.get(base, DEFAULT_LEVERAGES['default'])
+                    bot.set_leverage_for_symbol(sym, lev)
+
+                    df = bot.fetch_ohlcv_df(sym, TIMEFRAME, limit=200)
+                    if len(df) < max(BB_PERIOD, MACD_SLOW) + 2:
+                        logger.warning(f"not enough bars for {sym}")
+                        continue
+                    signals = check_signals_from_df(df)
+                    positions = bot.get_positions(sym)
+                    logger.info(f"{sym} signals={signals} positions={positions}")
+
+                    # Long logic (independent)
+                    if signals['long_entry']:
+                        # open long even if short exists (hedge mode allows both)
+                        logger.info(f"{sym}: long_entry -> attempt open long")
+                        bot.create_market_order(sym, 'buy', 'long', per_symbol_usdt)
+                    elif signals['long_exit']:
+                        # close long side if exists
+                        logger.info(f"{sym}: long_exit -> attempt close long")
+                        bot.close_side_position(sym, 'long')
+
+                    # Short logic (independent)
+                    if signals['short_entry']:
+                        logger.info(f"{sym}: short_entry -> attempt open short")
+                        bot.create_market_order(sym, 'sell', 'short', per_symbol_usdt)
+                    elif signals['short_exit']:
+                        logger.info(f"{sym}: short_exit -> attempt close short")
+                        bot.close_side_position(sym, 'short')
+
+                    # small sleep between symbols to avoid rate limits
+                    time.sleep(1)
+                except Exception as e_sym:
+                    logger.exception(f"Error processing {sym}: {e_sym}")
+                    time.sleep(1)
+
+            time.sleep(SLEEP_SECONDS)
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user. Exiting.")
+            break
+        except Exception as e:
+            logger.exception(f"Main loop error: {e}")
+            time.sleep(5)
+
+if __name__ == '__main__':
+    logger.info(f"Starting with symbols={DEFAULT_SYMBOLS}, SANDBOX={SANDBOX}")
+    main_loop(DEFAULT_SYMBOLS)
