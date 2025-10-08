@@ -134,46 +134,38 @@ class OKXHedgeBot:
             logger.info(f"{s} min_size={min_sz} size_inc={size_inc} tick={tick}")
 
     def _ensure_hedge_mode(self):
-        """Try to set OKX to hedge/dual-mode (posMode = 'long_short_mode')"""
+        """将 OKX 设置为双向持仓（hedge, long_short_mode）"""
         try:
-            # OKX endpoint may be account/position-mode or account/set-position-mode depending on wrapper
-            # We'll try common variants
-            params = {'posMode': 'long_short_mode'}
-            try:
-                resp = self.exchange.private_post_account_set_position_mode(params)
-                logger.info(f"Set position mode resp: {resp}")
-            except Exception:
-                try:
-                    resp = self.exchange.private_post_account_set_positionmode(params)
-                    logger.info(f"Set position mode resp alt: {resp}")
-                except Exception as e:
-                    logger.warning(f"Unable to set position mode via private_post. Error: {e}")
-            # Also try unified helper if exists
             if hasattr(self.exchange, 'set_position_mode'):
-                try:
-                    self.exchange.set_position_mode(True)  # sometimes expects boolean
-                    logger.info("Called exchange.set_position_mode(True)")
-                except Exception:
-                    pass
+                self.exchange.set_position_mode(True)
+                logger.info("Position mode set to hedge (long_short_mode)")
+            else:
+                logger.warning("exchange.set_position_mode 不可用；请在 OKX 后台确认账户持仓模式为双向（对冲）。")
         except Exception as e:
-            logger.exception(f"Error ensuring hedge mode: {e}")
+            logger.warning(f"Unable to set hedge mode automatically: {e}")
 
     def fetch_balance_usdt(self) -> float:
         try:
+            # OKX 合约账户可加类型参数；不加也可，由 ccxt 适配
             bal = self.exchange.fetch_balance()
             usdt = 0.0
-            # unified dictionary
-            if 'USDT' in bal.get('free', {}):
-                usdt = float(bal['free'].get('USDT', 0) or 0)
+            # 优先从 free 读取
+            free = bal.get('free') or {}
+            if 'USDT' in free:
+                usdt = float(free.get('USDT') or 0)
             else:
-                # fallback try different layouts
-                for k, v in (bal.get('total') or {}).items():
-                    if k.upper() == 'USDT':
+                # 兼容不同结构
+                totals = bal.get('total') or {}
+                for k, v in totals.items():
+                    if str(k).upper() == 'USDT':
                         usdt = float(v or 0)
                         break
             return usdt
+        except ccxt.AuthenticationError as e:
+            logger.error(f"认证失败：请检查 OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE 是否配置正确。详细：{e}")
+            return 0.0
         except Exception as e:
-            logger.exception(f"fetch_balance error: {e}")
+            logger.exception(f"fetch_balance 异常：{e}")
             return 0.0
 
     def safe_amount(self, symbol: str, raw_amount: float) -> float:
@@ -430,5 +422,13 @@ def main_loop(symbols):
             time.sleep(5)
 
 if __name__ == '__main__':
+    missing = [k for k, v in [
+        ('OKX_API_KEY', OKX_API_KEY),
+        ('OKX_API_SECRET', OKX_API_SECRET),
+        ('OKX_API_PASSPHRASE', OKX_API_PASSPHRASE),
+    ] if not v]
+    if missing:
+        logger.error(f"缺少环境变量: {', '.join(missing)}。请在部署环境（如 Railway Variables）中配置后重启。")
+        raise SystemExit(1)
     logger.info(f"Starting with symbols={DEFAULT_SYMBOLS}, SANDBOX={SANDBOX}")
     main_loop(DEFAULT_SYMBOLS)
