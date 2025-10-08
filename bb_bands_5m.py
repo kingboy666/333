@@ -20,11 +20,18 @@ import numpy as np
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
-# 尝试从 .env 加载环境变量（若文件存在）
+# 尝试从 .env 与 OKX.env 加载环境变量（若文件存在）
 try:
     from dotenv import load_dotenv  # pip install python-dotenv
+    # 默认加载 .env
     load_dotenv()
     logger.info(".env 已加载（若存在）")
+    # 兼容自定义文件名 OKX.env（不覆盖已有环境变量）
+    try:
+        load_dotenv(dotenv_path='OKX.env', override=False)
+        logger.info("OKX.env 已加载（若存在）")
+    except Exception:
+        pass
 except Exception:
     # 未安装或其它异常时忽略，仍可用系统环境变量
     pass
@@ -46,7 +53,14 @@ def _getenv_multi(keys, default=""):
 
 ENV_ALIASES = {
     'OKX_API_KEY': ['OKX_API_KEY', 'OKX_KEY'],
-    'OKX_API_SECRET': ['OKX_API_SECRET', 'OKX_SECRET', 'OKX_API_SECRETS'],
+    'OKX_API_SECRET': [
+        'OKX_API_SECRET',
+        'OKX_SECRET',
+        'OKX_API_SECRETS',
+        'OKX_SECRET_KEY',
+        'OKX_API_SECRET_KEY',
+        'API_SECRET'
+    ],
     'OKX_API_PASSPHRASE': ['OKX_API_PASSPHRASE', 'OKX_PASSPHRASE', 'OKX_PASSWORD', 'OKX_API_PASSWORD'],
     'SANDBOX': ['SANDBOX']
 }
@@ -63,6 +77,13 @@ for base, aliases in ENV_ALIASES.items():
         logger.info(f"{base} present={present}")
     except Exception:
         logger.info(f"{base} present=False")
+
+# 额外调试：列出所有包含“OKX”的环境变量名（不含值），帮助定位键名不一致问题
+try:
+    okx_keys = [k for k in os.environ.keys() if 'OKX' in k.upper()]
+    logger.info(f"OKX-related env keys detected: {okx_keys}")
+except Exception:
+    pass
 
 TIMEFRAME = '5m'
 BB_PERIOD = 20
@@ -82,7 +103,19 @@ DEFAULT_LEVERAGES = {'ZRO': 20, 'default': 30}
 TD_MODE = os.getenv('TD_MODE', 'cross')
 
 # minimum USDT exposure per symbol (to avoid zero orders)
-MIN_USDT_PER_SYMBOL = 0.5  # still try for tiny balances
+# 支持通过环境变量配置，兼容 MIN_USDT_PER_SYMBOL 与 PER_SYMBOL_MIN_USDT
+def _getfloat_env(keys, default: float):
+    for k in keys:
+        v = _getenv_strip(k, '')
+        if v:
+            try:
+                return float(v)
+            except Exception:
+                logger.warning(f"环境变量 {k} 值无效（需为数字），已使用默认 {default}")
+                break
+    return default
+
+MIN_USDT_PER_SYMBOL = _getfloat_env(['MIN_USDT_PER_SYMBOL', 'PER_SYMBOL_MIN_USDT'], 0.5)  # still try for tiny balances
 
 # ---------------- Indicators ----------------
 def compute_macd(close: pd.Series, fast=12, slow=26, signal=9):

@@ -1,1 +1,1 @@
-worker: python bb_bands_5m.py
+worker: bash -lc 'export SCAN_INTERVAL=1 USE_OKX_NATIVE_ONLY=1 PER_SYMBOL_MIN_USDT=5 && python bb_bands_5m.py'
