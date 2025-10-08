@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "bash -lc 'python bb_bands_5m.py'",
+    "startCommand": "bash -lc 'python macd_6_16_9.py'",
     "env": {
       "SCAN_INTERVAL": "1",
       "USE_OKX_NATIVE_ONLY": "1",
