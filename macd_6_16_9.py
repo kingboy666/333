@@ -145,14 +145,14 @@ class MACDStrategy:
         
         # 交易对配置 - 小币种
         self.symbols = [
-            'FIL/USDT:USDT',
-            'ZRO/USDT:USDT',
-            'WIF/USDT:USDT',
-            'WLD/USDT:USDT'
+            'ETH/USDT:USDT',
+            'BTC/USDT:USDT',
+            'SOL/USDT:USDT',
+            'DOGE/USDT:USDT'
         ]
         
-        # 时间周期 - 5分钟
-        self.timeframe = '5m'
+        # 时间周期 - 15分钟
+        self.timeframe = '15m'
         
         # MACD参数
         self.fast_period = 10
@@ -514,7 +514,7 @@ class MACDStrategy:
             return 0.0
     
     def get_klines(self, symbol: str, limit: int = 100) -> List[Dict]:
-        """获取K线数据 - 5分钟周期（OKX v5 原生接口）"""
+        """获取K线数据 - 15分钟周期（OKX v5 原生接口）"""
         try:
             inst_id = self.symbol_to_inst_id(symbol)
             # OKX v5: /api/v5/market/candles?instId=...&bar=15m&limit=...
@@ -991,72 +991,6 @@ class MACDStrategy:
             'signal_line': signal_line
         }
     
-    # === 新增：ATR 与 ADX 计算（Wilder算法） ===
-    def calculate_atr(self, klines: List[Dict], period: int = 14) -> float:
-        """计算 ATR（Wilder），返回最新值；klines需含 high/low/close，按时间升序"""
-        try:
-            if len(klines) < period + 1:
-                return 0.0
-            highs = np.array([k['high'] for k in klines], dtype=float)
-            lows = np.array([k['low'] for k in klines], dtype=float)
-            closes = np.array([k['close'] for k in klines], dtype=float)
-            prev_closes = np.concatenate(([closes[0]], closes[:-1]))
-            tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_closes), np.abs(lows - prev_closes)))
-            # Wilder 平滑：先用TR的period均值作为首个ATR，再进行递推
-            atr = np.zeros_like(tr)
-            atr[period-1] = tr[:period].mean()
-            for i in range(period, len(tr)):
-                atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
-            return float(atr[-1])
-        except Exception:
-            return 0.0
-
-    def calculate_adx(self, klines: List[Dict], period: int = 14) -> float:
-        """计算 ADX（Wilder），返回最新值；klines需含 high/low/close，按时间升序"""
-        try:
-            if len(klines) < period + 1:
-                return 0.0
-            highs = np.array([k['high'] for k in klines], dtype=float)
-            lows = np.array([k['low'] for k in klines], dtype=float)
-            closes = np.array([k['close'] for k in klines], dtype=float)
-
-            up_move = highs[1:] - highs[:-1]
-            down_move = lows[:-1] - lows[1:]
-            plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-            minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-            prev_closes = closes[:-1]
-            tr = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_closes), np.abs(lows[1:] - prev_closes)))
-
-            # Wilder 平滑
-            def wilder_smooth(arr):
-                sm = np.zeros_like(arr)
-                sm[period-1] = arr[:period].sum()
-                for i in range(period, len(arr)):
-                    sm[i] = sm[i-1] - (sm[i-1] / period) + arr[i]
-                return sm
-
-            plus_dm_sm = wilder_smooth(plus_dm)
-            minus_dm_sm = wilder_smooth(minus_dm)
-            tr_sm = wilder_smooth(tr)
-
-            # 避免除零
-            tr_sm_safe = np.where(tr_sm == 0, 1e-12, tr_sm)
-
-            plus_di = 100.0 * (plus_dm_sm / tr_sm_safe)
-            minus_di = 100.0 * (minus_dm_sm / tr_sm_safe)
-            dx = 100.0 * (np.abs(plus_di - minus_di) / np.maximum(plus_di + minus_di, 1e-12))
-
-            # ADX 为 DX 的 Wilder 平滑
-            adx = np.zeros_like(dx)
-            adx[period-1] = dx[:period].mean()
-            for i in range(period, len(dx)):
-                adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
-
-            return float(adx[-1])
-        except Exception:
-            return 0.0
-
     def analyze_symbol(self, symbol: str) -> Dict[str, str]:
         """分析单个交易对"""
         try:
@@ -1071,129 +1005,12 @@ class MACDStrategy:
             if len(closes) < 2:
                 return {'signal': 'hold', 'reason': '数据不足'}
 
-            # === 先做ATR与ADX过滤 ===
-            try:
-                atr_period = int((os.environ.get('ATR_PERIOD') or '14').strip())
-            except Exception:
-                atr_period = 14
-            try:
-                atr_ratio_thresh = float((os.environ.get('ATR_RATIO_THRESH') or '0.004').strip())
-            except Exception:
-                atr_ratio_thresh = 0.004
-            try:
-                adx_period = int((os.environ.get('ADX_PERIOD') or '14').strip())
-            except Exception:
-                adx_period = 14
-            try:
-                adx_min_trend = float((os.environ.get('ADX_MIN_TREND') or '25').strip())
-            except Exception:
-                adx_min_trend = 25.0
-
-            close_price = float(closes[-1])
-            atr_val = self.calculate_atr(klines, atr_period)
-            adx_val = self.calculate_adx(klines, adx_period)
-
-            if atr_val > 0 and close_price > 0:
-                atr_ratio = atr_val / close_price
-                if atr_ratio < atr_ratio_thresh:
-                    return {'signal': 'hold', 'reason': f'ATR滤波：波动率低（ATR/收盘={atr_ratio:.4f} < {atr_ratio_thresh}）'}
-
-            if adx_val > 0 and adx_val < adx_min_trend:
-                return {'signal': 'hold', 'reason': f'ADX滤波：趋势不足（ADX={adx_val:.1f} < {adx_min_trend}）'}
-
-            # === ATR/ADX 过滤 ===
-            try:
-                atr_period = int((os.environ.get('ATR_PERIOD') or '14').strip())
-            except Exception:
-                atr_period = 14
-            try:
-                atr_ratio_thresh = float((os.environ.get('ATR_RATIO_THRESH') or '0.004').strip())
-            except Exception:
-                atr_ratio_thresh = 0.004
-            try:
-                adx_period = int((os.environ.get('ADX_PERIOD') or '14').strip())
-            except Exception:
-                adx_period = 14
-            try:
-                adx_min_trend = float((os.environ.get('ADX_MIN_TREND') or '25').strip())
-            except Exception:
-                adx_min_trend = 25.0
-
-            # 计算 ATR（Wilder）
-            atr_val = 0.0
-            if len(klines) >= atr_period + 1:
-                highs = np.array([k['high'] for k in klines], dtype=float)
-                lows = np.array([k['low'] for k in klines], dtype=float)
-                closes_arr = np.array([k['close'] for k in klines], dtype=float)
-                prev_closes = np.concatenate(([closes_arr[0]], closes_arr[:-1]))
-                tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_closes), np.abs(lows - prev_closes)))
-                atr = np.zeros_like(tr)
-                atr[atr_period-1] = tr[:atr_period].mean()
-                for i in range(atr_period, len(tr)):
-                    atr[i] = (atr[i-1] * (atr_period - 1) + tr[i]) / atr_period
-                atr_val = float(atr[-1])
-
-            close_price = float(closes[-1])
-            if atr_val > 0 and close_price > 0:
-                atr_ratio = atr_val / close_price
-                if atr_ratio < atr_ratio_thresh:
-                    return {'signal': 'hold', 'reason': f'ATR滤波：波动率低（ATR/收盘={atr_ratio:.4f} < {atr_ratio_thresh}）'}
-
-            # 计算 ADX（Wilder）
-            adx_val = 0.0
-            if len(klines) >= adx_period + 1:
-                highs = np.array([k['high'] for k in klines], dtype=float)
-                lows = np.array([k['low'] for k in klines], dtype=float)
-                closes_arr2 = np.array([k['close'] for k in klines], dtype=float)
-
-                up_move = highs[1:] - highs[:-1]
-                down_move = lows[:-1] - lows[1:]
-                plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-                minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-                prev_closes2 = closes_arr2[:-1]
-                tr2 = np.maximum(highs[1:] - lows[1:], np.maximum(np.abs(highs[1:] - prev_closes2), np.abs(lows[1:] - prev_closes2)))
-
-                def wilder_smooth(arr, per):
-                    sm = np.zeros_like(arr)
-                    sm[per-1] = arr[:per].sum()
-                    for i in range(per, len(arr)):
-                        sm[i] = sm[i-1] - (sm[i-1] / per) + arr[i]
-                    return sm
-
-                plus_dm_sm = wilder_smooth(plus_dm, adx_period)
-                minus_dm_sm = wilder_smooth(minus_dm, adx_period)
-                tr_sm = wilder_smooth(tr2, adx_period)
-
-                tr_sm_safe = np.where(tr_sm == 0, 1e-12, tr_sm)
-                plus_di = 100.0 * (plus_dm_sm / tr_sm_safe)
-                minus_di = 100.0 * (minus_dm_sm / tr_sm_safe)
-                dx = 100.0 * (np.abs(plus_di - minus_di) / np.maximum(plus_di + minus_di, 1e-12))
-
-                adx = np.zeros_like(dx)
-                adx[adx_period-1] = dx[:adx_period].mean()
-                for i in range(adx_period, len(dx)):
-                    adx[i] = (adx[i-1] * (adx_period - 1) + dx[i]) / adx_period
-                adx_val = float(adx[-1])
-
-            if adx_val > 0 and adx_val < adx_min_trend:
-                return {'signal': 'hold', 'reason': f'ADX滤波：趋势不足（ADX={adx_val:.1f} < {adx_min_trend}）'}
-
             # 使用实时K线：当前与前一根（不等待收盘）
             macd_current = self.calculate_macd(closes)
             macd_prev = self.calculate_macd(closes[:-1])
             
             # 获取持仓（强制刷新，确保信号判断基于最新持仓）
             position = self.get_position(symbol, force_refresh=True)
-            try:
-                logger.debug(f"📏 {symbol} ATR={atr_val:.6f}, ATR/Close={atr_val/close_price:.6f} | ADX={adx_val:.2f}")
-            except Exception:
-                pass
-            # 可选：在日志里输出ATR/ADX，用于回溯
-            try:
-                logger.debug(f"📏 {symbol} ATR({atr_period})={atr_val:.6f}, ATR/Close={atr_val/close_price:.6f} | ADX({adx_period})={adx_val:.2f}")
-            except Exception:
-                pass
             
             # 使用实时K线进行交叉与柱状图颜色变化判断
             prev_macd = macd_prev['macd']
@@ -1245,7 +1062,7 @@ class MACDStrategy:
     def execute_strategy(self):
         """执行策略"""
         logger.info("=" * 70)
-        logger.info("🚀 开始执行MACD策略 (分币种杠杆，5分钟周期)")
+        logger.info("🚀 开始执行MACD策略 (分币种杠杆，15分钟周期)")
         logger.info("=" * 70)
         
         try:
@@ -1332,7 +1149,7 @@ class MACDStrategy:
         logger.info("🚀 MACD策略启动 - RAILWAY平台版 (小币种)")
         logger.info("=" * 70)
         logger.info(f"📈 MACD参数: 快线={self.fast_period}, 慢线={self.slow_period}, 信号线={self.signal_period}")
-        logger.info(f"📊 K线周期: {self.timeframe} (5分钟)")
+        logger.info(f"📊 K线周期: {self.timeframe} (15分钟)")
         lev_desc = ', '.join([f"{s.split('/')[0]}={self.symbol_leverage.get(s, 20)}x" for s in self.symbols])
         logger.info(f"💪 杠杆倍数: {lev_desc}")
         logger.info("⏰ 刷新方式: 实时巡检（每interval秒执行一次，可用环境变量 SCAN_INTERVAL 调整，默认1秒）")
