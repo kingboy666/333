@@ -20,6 +20,14 @@ import numpy as np
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
+# 尝试从 .env 加载环境变量（若文件存在）
+try:
+    from dotenv import load_dotenv  # pip install python-dotenv
+    load_dotenv()
+    logger.info(".env 已加载（若存在）")
+except Exception:
+    # 未安装或其它异常时忽略，仍可用系统环境变量
+    pass
 
 # ---------------- Config ----------------
 OKX_API_KEY = os.getenv('OKX_API_KEY', '')
