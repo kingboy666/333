@@ -137,34 +137,54 @@ def compute_bollinger(close: pd.Series, period=20, std=2.0):
 class OKXHedgeBot:
     def __init__(self, symbols):
         self.symbols = symbols
-        self.exchange = ccxt.okx({
-            'apiKey': OKX_API_KEY,
-            'secret': OKX_API_SECRET,
-            'password': OKX_API_PASSPHRASE,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
-        })
-        if SANDBOX:
-            logger.warning("SANDBOX MODE ENABLED")
-            self.exchange.set_sandbox_mode(True)
+        self.exchange = None
+        self.markets = {}
+        self.positions = {}
+        self.api_key = os.getenv("OKX_API_KEY")
+        self.secret_key = os.getenv("OKX_API_SECRET") or os.getenv("OKX_SECRET_KEY")
+        self.passphrase = os.getenv("OKX_API_PASSPHRASE") or os.getenv("OKX_PASSPHRASE")
+        self.sandbox = os.getenv("SANDBOX", "False").lower() == "true"
 
-        # load markets: limit to swap to avoid OKX entries with missing base/quote
-        self.markets = self.exchange.load_markets(True, {'type': 'swap'})
-        # map symbol->market & instId
-        self.market_map = {}
-        for s in symbols:
-            m = self.markets.get(s)
-            if not m:
-                logger.error(f"Symbol {s} not in exchange.load_markets()")
-                raise ValueError(f"{s} not available")
-            inst = None
-            info = m.get('info', {})
-            inst = info.get('instId') or info.get('symbol') or m.get('id')
-            self.market_map[s] = {'market': m, 'instId': inst}
-        # prepare market info (min size, step)
-        self._prepare_market_infos()
-        # try to set position mode to hedge (OKX: dual/hedge)
-        self._ensure_hedge_mode()
+        logger.info(f"OKX_API_KEY present={bool(self.api_key)}")
+        logger.info(f"OKX_API_SECRET present={bool(self.secret_key)}")
+        logger.info(f"OKX_API_PASSPHRASE present={bool(self.passphrase)}")
+        logger.info(f"SANDBOX present={self.sandbox}")
+        logger.info(f"OKX-related env keys detected: {[k for k in os.environ if 'OKX' in k]}")
+
+        # 初始化 OKX 交易所
+        try:
+            self.exchange = ccxt.okx({
+                'apiKey': self.api_key,
+                'secret': self.secret_key,
+                'password': self.passphrase,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'swap'},
+            })
+            if self.sandbox:
+                self.exchange.set_sandbox_mode(True)
+
+            # ✅ 加载市场信息，仅保留 swap 类型市场
+            all_markets = self.exchange.load_markets(True)
+            self.markets = {
+                k: v for k, v in all_markets.items()
+                if v.get('type') == 'swap'
+            }
+
+            logger.info(f"✅ 已加载 {len(self.markets)} 个 swap 市场")
+        except Exception as e:
+            logger.error(f"❌ 加载 OKX 市场信息失败: {e}")
+            self.markets = {}
+
+        # 确认交易对格式
+        corrected_symbols = []
+        for s in self.symbols:
+            if not s.endswith(":USDT"):
+                corrected_symbols.append(f"{s}:USDT")
+            else:
+                corrected_symbols.append(s)
+        self.symbols = corrected_symbols
+
+        logger.info(f"✅ 启动交易对: {self.symbols}, SANDBOX={self.sandbox}")
 
     def _prepare_market_infos(self):
         for s, meta in self.market_map.items():
