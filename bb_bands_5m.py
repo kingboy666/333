@@ -148,8 +148,8 @@ class OKXHedgeBot:
             logger.warning("SANDBOX MODE ENABLED")
             self.exchange.set_sandbox_mode(True)
 
-        # load markets
-        self.markets = self.exchange.load_markets(True)
+        # load markets: limit to swap to avoid OKX entries with missing base/quote
+        self.markets = self.exchange.load_markets(True, {'type': 'swap'})
         # map symbol->market & instId
         self.market_map = {}
         for s in symbols:
