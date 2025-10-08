@@ -35,17 +35,34 @@ def _getenv_strip(key: str, default: str = "") -> str:
     return val.strip() if isinstance(val, str) else val
 
 # ---------------- Config ----------------
-OKX_API_KEY = _getenv_strip('OKX_API_KEY', '')
-OKX_API_SECRET = _getenv_strip('OKX_API_SECRET', '')
-OKX_API_PASSPHRASE = _getenv_strip('OKX_API_PASSPHRASE', '')
+def _getenv_multi(keys, default=""):
+    for k in keys:
+        v = _getenv_strip(k, "")
+        if v:
+            if k != keys[0]:
+                logger.warning(f"Using alternate env var '{k}' for '{keys[0]}'")
+            return v
+    return default
+
+ENV_ALIASES = {
+    'OKX_API_KEY': ['OKX_API_KEY', 'OKX_KEY'],
+    'OKX_API_SECRET': ['OKX_API_SECRET', 'OKX_SECRET', 'OKX_API_SECRETS'],
+    'OKX_API_PASSPHRASE': ['OKX_API_PASSPHRASE', 'OKX_PASSPHRASE', 'OKX_PASSWORD', 'OKX_API_PASSWORD'],
+    'SANDBOX': ['SANDBOX']
+}
+
+OKX_API_KEY = _getenv_multi(ENV_ALIASES['OKX_API_KEY'], '')
+OKX_API_SECRET = _getenv_multi(ENV_ALIASES['OKX_API_SECRET'], '')
+OKX_API_PASSPHRASE = _getenv_multi(ENV_ALIASES['OKX_API_PASSPHRASE'], '')
 SANDBOX = _getenv_strip('SANDBOX', 'false').lower() in ('1', 'true', 'yes')
+
 # 启动时仅打印是否存在，便于在 Railway Logs 排查；不打印真实值
-for _k in ('OKX_API_KEY', 'OKX_API_SECRET', 'OKX_API_PASSPHRASE', 'SANDBOX'):
+for base, aliases in ENV_ALIASES.items():
     try:
-        _present = bool(os.getenv(_k))
-        logger.info(f"{_k} present={_present}")
+        present = any(bool(os.getenv(a)) for a in aliases)
+        logger.info(f"{base} present={present}")
     except Exception:
-        logger.info(f"{_k} present=False")
+        logger.info(f"{base} present=False")
 
 TIMEFRAME = '5m'
 BB_PERIOD = 20
