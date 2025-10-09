@@ -158,6 +158,36 @@ class MACDStrategy:
         self.fast_period = 10
         self.slow_period = 40
         self.signal_period = 15
+
+        # 风险参数（按币种）
+        self.risk_params: Dict[str, Dict[str, float]] = {
+            'BTC/USDT:USDT': {'atr_period': 20, 'sl_mult': 2.2, 'tp_mult': 3.0, 'trigger_pct': 0.010, 'trail_pct': 0.006},
+            'ETH/USDT:USDT': {'atr_period': 20, 'sl_mult': 2.0, 'tp_mult': 3.0, 'trigger_pct': 0.010, 'trail_pct': 0.006},
+            'SOL/USDT:USDT': {'atr_period': 14, 'sl_mult': 1.8, 'tp_mult': 2.8, 'trigger_pct': 0.008, 'trail_pct': 0.005},
+            'DOGE/USDT:USDT': {'atr_period': 14, 'sl_mult': 1.6, 'tp_mult': 2.2, 'trigger_pct': 0.007, 'trail_pct': 0.004},
+        }
+
+        # MACD反手规则（close时是否反手）
+        self.reverse_on_close: Dict[str, bool] = {
+            'BTC/USDT:USDT': False,
+            'ETH/USDT:USDT': False,
+            'SOL/USDT:USDT': True,
+            'DOGE/USDT:USDT': False,
+        }
+
+        # ADX过滤阈值（按币种）；仅当 ADX ≥ 阈值 才允许进场
+        self.adx_thresholds: Dict[str, int] = {
+            'BTC/USDT:USDT': 25,
+            'ETH/USDT:USDT': 25,
+            'SOL/USDT:USDT': 23,
+            'DOGE/USDT:USDT': 28,
+        }
+        # 统一ADX周期
+        self.adx_period: int = 14
+
+        # 动态止盈状态
+        # 结构：{ symbol: {'active': bool, 'peak': float, 'trough': float} }
+        self.trailing_state: Dict[str, Dict[str, Any]] = {}
         
         # 杠杆配置 - 分币种设置
         self.symbol_leverage: Dict[str, int] = {
@@ -990,6 +1020,190 @@ class MACDStrategy:
             'macd_line': macd_line,
             'signal_line': signal_line
         }
+
+    def get_current_price(self, symbol: str) -> float:
+        """获取当前最新成交价（OKX v5 原生接口）"""
+        try:
+            inst_id = self.symbol_to_inst_id(symbol)
+            tkr = self.exchange.publicGetMarketTicker({'instId': inst_id})
+            if isinstance(tkr, dict):
+                d = (tkr.get('data') or [])
+                if isinstance(d, list) and d:
+                    return float(d[0].get('last') or d[0].get('lastPx') or 0.0)
+            return 0.0
+        except Exception as e:
+            logger.error(f"❌ 获取{symbol}最新价失败: {e}")
+            return 0.0
+
+    def calculate_atr(self, symbol: str, period: int = 14, limit: int = 200) -> float:
+        """计算ATR（True Range的EMA版本），默认拉取200根15m K线"""
+        try:
+            klines = self.get_klines(symbol, limit)
+            if len(klines) < period + 1:
+                return 0.0
+            highs = np.array([k['high'] for k in klines])
+            lows = np.array([k['low'] for k in klines])
+            closes = np.array([k['close'] for k in klines])
+            prev_closes = np.concatenate(([closes[0]], closes[:-1]))
+
+            tr = np.maximum.reduce([
+                highs - lows,
+                np.abs(highs - prev_closes),
+                np.abs(lows - prev_closes)
+            ])
+            atr_series = pd.Series(tr).ewm(span=period, adjust=False).mean().values
+            return float(atr_series[-1])
+        except Exception as e:
+            logger.error(f"❌ 计算{symbol} ATR失败: {e}")
+            return 0.0
+
+    def calculate_adx(self, symbol: str, period: int = 14, limit: int = 200) -> float:
+        """计算ADX（Wilder's ADX，使用RMA实现），返回最新值"""
+        try:
+            klines = self.get_klines(symbol, limit)
+            if len(klines) < period + 2:
+                return 0.0
+
+            highs = np.array([k['high'] for k in klines], dtype=float)
+            lows = np.array([k['low'] for k in klines], dtype=float)
+            closes = np.array([k['close'] for k in klines], dtype=float)
+
+            # 方向动量
+            up_move = highs[1:] - highs[:-1]
+            down_move = lows[:-1] - lows[1:]
+
+            plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+            minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+            # True Range
+            prev_close = closes[:-1]
+            tr_components = np.vstack([
+                highs[1:] - lows[1:],
+                np.abs(highs[1:] - prev_close),
+                np.abs(lows[1:] - prev_close)
+            ])
+            tr = np.max(tr_components, axis=0)
+
+            # Wilder's RMA (alpha = 1/period)
+            alpha = 1.0 / period
+            tr_rma = pd.Series(tr).ewm(alpha=alpha, adjust=False).mean().values
+            plus_dm_rma = pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean().values
+            minus_dm_rma = pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean().values
+
+            # DI+
+            plus_di = np.where(tr_rma > 0, 100.0 * (plus_dm_rma / tr_rma), 0.0)
+            minus_di = np.where(tr_rma > 0, 100.0 * (minus_dm_rma / tr_rma), 0.0)
+
+            # DX 与 ADX
+            dx = np.where(
+                (plus_di + minus_di) > 0,
+                100.0 * np.abs(plus_di - minus_di) / (plus_di + minus_di),
+                0.0
+            )
+            adx = pd.Series(dx).ewm(alpha=alpha, adjust=False).mean().values
+
+            # 最新ADX对应到序列末尾（注意长度：去掉了第一根）
+            latest_adx = float(adx[-1]) if len(adx) > 0 else 0.0
+            return latest_adx
+        except Exception as e:
+            logger.error(f"❌ 计算{symbol} ADX失败: {e}")
+            return 0.0
+
+    def manage_risk(self, symbol: str, position: Dict) -> bool:
+        """风险管理：ATR止损/止盈 + 动态触发/回撤追踪。返回True表示已平仓。"""
+        try:
+            if position.get('size', 0) <= 0:
+                return False
+
+            params = self.risk_params.get(symbol, None)
+            if not params:
+                return False
+
+            atr = self.calculate_atr(symbol, period=int(params.get('atr_period', 14)))
+            price = self.get_current_price(symbol)
+            if atr <= 0 or price <= 0:
+                return False
+
+            entry = float(position.get('entry_price', 0) or 0)
+            if entry <= 0:
+                return False
+
+            side = position.get('side')
+            sl_mult = float(params['sl_mult'])
+            tp_mult = float(params['tp_mult'])
+            trigger_pct = float(params['trigger_pct'])
+            trail_pct = float(params['trail_pct'])
+
+            # 初始化跟踪状态
+            ts = self.trailing_state.get(symbol)
+            if not ts:
+                ts = {'active': False, 'peak': None, 'trough': None}
+                self.trailing_state[symbol] = ts
+
+            closed = False
+            reason = ""
+
+            if side == 'long':
+                stop_loss = entry - sl_mult * atr
+                take_profit = entry + tp_mult * atr
+
+                # 触发/更新峰值
+                ts['peak'] = price if ts['peak'] is None else max(ts['peak'], price)
+
+                # 固定止损/止盈
+                if price <= stop_loss:
+                    reason = f"📉 触发止损（ATR×{sl_mult:.2f}）"
+                    closed = True
+                elif price >= take_profit:
+                    reason = f"🎯 触发止盈（ATR×{tp_mult:.2f}）"
+                    closed = True
+                else:
+                    # 动态触发与回撤
+                    profit_pct = (price - entry) / entry
+                    if profit_pct >= trigger_pct:
+                        ts['active'] = True
+                    if ts['active'] and ts['peak']:
+                        drawdown_pct = (ts['peak'] - price) / ts['peak']
+                        if drawdown_pct >= trail_pct:
+                            reason = f"🔧 动态止盈回撤 {trail_pct*100:.1f}% 触发"
+                            closed = True
+
+            else:  # short
+                stop_loss = entry + sl_mult * atr
+                take_profit = entry - tp_mult * atr
+
+                # 触发/更新低点
+                ts['trough'] = price if ts['trough'] is None else min(ts['trough'], price)
+
+                if price >= stop_loss:
+                    reason = f"📉 空头止损（ATR×{sl_mult:.2f}）"
+                    closed = True
+                elif price <= take_profit:
+                    reason = f"🎯 空头止盈（ATR×{tp_mult:.2f}）"
+                    closed = True
+                else:
+                    profit_pct = (entry - price) / entry
+                    if profit_pct >= trigger_pct:
+                        ts['active'] = True
+                    if ts['active'] and ts['trough'] is not None:
+                        rebound_pct = (price - ts['trough']) / ts['trough']
+                        if rebound_pct >= trail_pct:
+                            reason = f"🔧 动态止盈回撤 {trail_pct*100:.1f}% 触发"
+                            closed = True
+
+            if closed:
+                logger.info(f"🛡️ 风险管理触发 {symbol} -> {reason} | 当前价:{price:.4f} | 入场:{entry:.4f} | ATR:{atr:.6f}")
+                # 风险管理只平仓，不反手
+                if self.close_position(symbol, open_reverse=False):
+                    # 重置该symbol的跟踪状态
+                    self.trailing_state[symbol] = {'active': False, 'peak': None, 'trough': None}
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"❌ {symbol} 风险管理异常: {e}")
+            return False
     
     def analyze_symbol(self, symbol: str) -> Dict[str, str]:
         """分析单个交易对"""
@@ -1019,35 +1233,37 @@ class MACDStrategy:
             current_macd = macd_current['macd']
             current_signal = macd_current['signal']
             current_hist = macd_current['histogram']
-            
-            logger.debug(f"📊 {symbol} MACD(实时) - 当前: MACD={current_macd:.6f}, Signal={current_signal:.6f}, Hist={current_hist:.6f}")
-            
+
+            # 计算ADX并应用过滤（仅影响进场）
+            adx_val = self.calculate_adx(symbol, period=self.adx_period)
+            adx_th = int(self.adx_thresholds.get(symbol, 25))
+            logger.debug(f"📊 {symbol} MACD(实时) - 当前: MACD={current_macd:.6f}, Signal={current_signal:.6f}, Hist={current_hist:.6f} | ADX={adx_val:.2f} 阈值={adx_th}")
+
             # 生成交易信号
-            if position['size'] == 0:  # 无持仓
+            if position['size'] == 0:  # 无持仓：先检查ADX过滤
+                if adx_val < adx_th:
+                    return {'signal': 'hold', 'reason': f'ADX({adx_val:.2f})低于阈值{adx_th}，过滤震荡不进场'}
                 # 金叉信号：快线上穿慢线 或 柱状图由绿转红（负到正）
                 if (prev_macd <= prev_signal and current_macd > current_signal) or (prev_hist <= 0 and current_hist > 0):
-                    return {'signal': 'buy', 'reason': 'MACD金叉（快线上穿慢线）'}
-                
+                    return {'signal': 'buy', 'reason': f'MACD金叉且ADX({adx_val:.2f})≥{adx_th}'}
                 # 死叉信号：快线下穿慢线 或 柱状图由红转绿（正到负）
                 elif (prev_macd >= prev_signal and current_macd < current_signal) or (prev_hist >= 0 and current_hist < 0):
-                    return {'signal': 'sell', 'reason': 'MACD死叉（快线下穿慢线）'}
-                
+                    return {'signal': 'sell', 'reason': f'MACD死叉且ADX({adx_val:.2f})≥{adx_th}'}
                 else:
                     return {'signal': 'hold', 'reason': '等待交叉信号'}
-            
-            else:  # 有持仓
+
+            else:  # 有持仓：平仓逻辑仍以MACD为主（风险管理已在执行流程先行处理）
                 current_position_side = position['side']
-                
                 # 检查持仓方向是否与上次记录一致，如果一致说明没有平仓过
                 last_side = self.last_position_state.get(symbol, 'none')
-                
+
                 if current_position_side == 'long':
                     # 多头平仓：快线下穿慢线 或 柱状图转负
                     if (prev_macd >= prev_signal and current_macd < current_signal) or (current_hist < 0):
                         return {'signal': 'close', 'reason': '多头平仓（死叉）'}
                     else:
                         return {'signal': 'hold', 'reason': '持有多头'}
-                
+
                 else:  # short
                     # 空头平仓：快线上穿慢线 或 柱状图转正
                     if (prev_macd <= prev_signal and current_macd > current_signal) or (current_hist > 0):
@@ -1106,6 +1322,14 @@ class MACDStrategy:
                 
                 # 获取当前持仓（强制刷新，确保动作基于最新状态）
                 current_position = self.get_position(symbol, force_refresh=True)
+
+                # 先进行风险管理（ATR止损/止盈 + 动态追踪）
+                try:
+                    if self.manage_risk(symbol, current_position):
+                        logger.info(f"✅ {symbol} 已按风险规则平仓，跳过当轮信号处理")
+                        continue
+                except Exception as _e:
+                    logger.error(f"❌ {symbol} 风险管理处理失败: {_e}")
                 
                 if signal == 'buy':
                     # 检查是否已经是多头持仓，如果是则不重复开仓
@@ -1134,9 +1358,11 @@ class MACDStrategy:
                             self.last_position_state[symbol] = 'short'
                 
                 elif signal == 'close':
-                    # 平仓并反手开仓
-                    if self.close_position(symbol, open_reverse=True):
-                        logger.info(f"✅ 平仓并反手开仓 {symbol} 成功 - {reason}")
+                    # 按币种规则决定是否反手
+                    open_reverse = self.reverse_on_close.get(symbol, False)
+                    if self.close_position(symbol, open_reverse=open_reverse):
+                        act = "平仓并反手开仓" if open_reverse else "平仓"
+                        logger.info(f"✅ {act} {symbol} 成功 - {reason}")
             
             logger.info("=" * 70)
                         
