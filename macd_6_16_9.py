@@ -376,6 +376,8 @@ class MACDStrategy:
     def get_open_algo_orders(self, symbol: str) -> List[Dict]:
         """获取未触发的条件单（TP/SL）"""
         try:
+            if not hasattr(self, 'single_algo_tp_sl'):
+                self.single_algo_tp_sl = True
             inst_id = self.symbol_to_inst_id(symbol)
             resp = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id, 'ordType': 'conditional'})
             data = resp.get('data') if isinstance(resp, dict) else resp
@@ -466,25 +468,30 @@ class MACDStrategy:
             messages = []
 
             if place_tp and place_sl:
-                # 先尝试合并提交；若失败则回退为分开提交
+                # 组合提交优先；若 single_algo_tp_sl=True 则失败不拆分，避免生成两条
                 payload_both = dict(raw_base)
                 payload_both.update({
                     'tpTriggerPx': f"{tp_px:.8f}",
-                    'tpOrdPx': '-1',
+                    'tpOrdPx': f"{tp_px:.8f}",  # TP 限价触发
                     'tpTriggerPxType': 'last',
                     'slTriggerPx': f"{sl_px:.8f}",
-                    'slOrdPx': '-1',
+                    'slOrdPx': '-1',           # SL 市价触发
                     'slTriggerPxType': 'last',
                 })
                 ok_both, _ = _post(payload_both, 'TP+SL')
                 if ok_both:
-                    logger.info(f"🛡️ 已为{symbol}挂出条件单 | TP@{tp_px:.6f} SL@{sl_px:.6f} | size={size:.6f}")
+                    logger.info(f"🛡️ 已为{symbol}挂出组合条件单 | TP@{tp_px:.6f} SL@{sl_px:.6f} | size={size:.6f}")
                     return True
-                # 回退：分别提交
+
+                if getattr(self, 'single_algo_tp_sl', True):
+                    logger.warning(f"⚠️ 组合条件单提交失败，已禁止拆分提交，跳过以避免两条条件单")
+                    return False
+
+                # 允许拆分时的回退（保留）
                 payload_tp = dict(raw_base)
                 payload_tp.update({
                     'tpTriggerPx': f"{tp_px:.8f}",
-                    'tpOrdPx': '-1',
+                    'tpOrdPx': f"{tp_px:.8f}",
                     'tpTriggerPxType': 'last',
                 })
                 ok_tp, _ = _post(payload_tp, 'TP')
@@ -600,16 +607,50 @@ class MACDStrategy:
                 logger.info(f"🧷 {symbol} 持仓已存在TP/SL条件单（posSide={pos_side}）")
                 return
 
-            placed = self.place_tp_sl_orders(
-                symbol,
-                position,
-                place_tp=(not has_tp),
-                place_sl=(not has_sl),
-            )
+            # 仅保留组合条件单：若只存在一侧，则先取消该侧再重建组合
+            if getattr(self, 'single_algo_tp_sl', True) and (has_tp ^ has_sl):
+                try:
+                    self.cancel_algo_orders(symbol, pos_side)
+                    logger.info(f"🧹 已取消 {symbol}({pos_side}) 单侧条件单，准备重建组合TP+SL")
+                except Exception as ce:
+                    logger.warning(f"⚠️ 取消现有条件单失败，跳过重建以避免重复: {ce}")
+                    return
+                placed = self.place_tp_sl_orders(symbol, position, place_tp=True, place_sl=True)
+            else:
+                placed = self.place_tp_sl_orders(
+                    symbol,
+                    position,
+                    place_tp=(not has_tp),
+                    place_sl=(not has_sl),
+                )
             if placed:
                 self._algo_guard[key] = now
         except Exception as e:
             logger.error(f"❌ 确保{symbol}持仓保护失败: {e}")
+
+    def cancel_algo_orders(self, symbol: str, pos_side: str) -> bool:
+        """取消某个posSide下的所有条件单（TP/SL）"""
+        try:
+            inst_id = self.symbol_to_inst_id(symbol)
+            algo_orders = self.get_open_algo_orders(symbol)
+            to_cancel = []
+            for o in algo_orders:
+                if (o.get('posSide') or '').lower() == (pos_side or '').lower():
+                    algo_id = o.get('id')
+                    if algo_id:
+                        to_cancel.append({'algoId': str(algo_id), 'instId': inst_id})
+            if not to_cancel:
+                return True
+            resp = self.exchange.privatePostTradeCancelAlgos(to_cancel)
+            ok = isinstance(resp, dict) or isinstance(resp, list)
+            if ok:
+                logger.info(f"✅ 取消{symbol}({pos_side})条件单: {len(to_cancel)} 条")
+            else:
+                logger.warning(f"⚠️ 取消{symbol}({pos_side})条件单返回异常: {resp}")
+            return ok
+        except Exception as e:
+            logger.error(f"❌ 取消{symbol}({pos_side})条件单失败: {e}")
+            return False
 
     def cancel_all_orders(self, symbol: str) -> bool:
         """取消所有未成交订单"""
