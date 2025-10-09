@@ -372,6 +372,99 @@ class MACDStrategy:
             logger.error(f"❌ 获取{symbol}挂单失败: {e}")
             return []
     
+    def get_open_algo_orders(self, symbol: str) -> List[Dict]:
+        """获取未触发的条件单（TP/SL）"""
+        try:
+            inst_id = self.symbol_to_inst_id(symbol)
+            resp = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id})
+            data = resp.get('data') if isinstance(resp, dict) else resp
+            results = []
+            for o in (data or []):
+                results.append({
+                    'id': o.get('algoId') or o.get('ordId') or o.get('clOrdId'),
+                    'posSide': o.get('posSide'),
+                    'tpTriggerPx': float(o.get('tpTriggerPx')) if o.get('tpTriggerPx') else None,
+                    'slTriggerPx': float(o.get('slTriggerPx')) if o.get('slTriggerPx') else None,
+                    'sz': float(o.get('sz') or 0),
+                })
+            return results
+        except Exception as e:
+            logger.error(f"❌ 获取{symbol}条件单失败: {e}")
+            return []
+
+    def place_tp_sl_orders(self, symbol: str, position: Dict) -> bool:
+        """为当前持仓挂条件单TP/SL（市价触发，reduceOnly）"""
+        try:
+            if position.get('size', 0) <= 0:
+                return False
+            params = self.risk_params.get(symbol)
+            if not params:
+                return False
+
+            atr = self.calculate_atr(symbol, period=int(params.get('atr_period', 14)))
+            entry = float(position.get('entry_price', 0) or 0)
+            if atr <= 0 or entry <= 0:
+                return False
+
+            side = position.get('side')
+            size = float(position.get('size', 0) or 0)
+            pos_side = 'long' if side == 'long' else 'short'
+            sl_mult = float(params['sl_mult'])
+            tp_mult = float(params['tp_mult'])
+
+            if side == 'long':
+                sl_px = max(0.0, entry - sl_mult * atr)
+                tp_px = entry + tp_mult * atr
+            else:
+                sl_px = entry + sl_mult * atr
+                tp_px = max(0.0, entry - tp_mult * atr)
+
+            inst_id = self.symbol_to_inst_id(symbol)
+            raw = {
+                'instId': inst_id,
+                'tdMode': 'cross',
+                'posSide': pos_side,
+                'reduceOnly': True,
+                'tpTriggerPx': f"{tp_px:.8f}",
+                'tpOrdPx': '-1',
+                'slTriggerPx': f"{sl_px:.8f}",
+                'slOrdPx': '-1',
+                'sz': str(size),
+            }
+            resp = self.exchange.privatePostTradeOrderAlgo(raw)
+            ok = isinstance(resp, dict)
+            if ok:
+                logger.info(f"🛡️ 已为{symbol}挂出TP/SL条件单 | TP@{tp_px:.6f} SL@{sl_px:.6f} | size={size:.6f}")
+            else:
+                logger.warning(f"⚠️ 挂出{symbol} TP/SL条件单返回异常: {resp}")
+            return ok
+        except Exception as e:
+            logger.error(f"❌ 挂{symbol} TP/SL条件单失败: {e}")
+            return False
+
+    def ensure_position_protection(self, symbol: str) -> None:
+        """若存在持仓但未配置TP/SL条件单，则自动补挂"""
+        try:
+            position = self.get_position(symbol, force_refresh=True)
+            if position.get('size', 0) <= 0:
+                return
+            pos_side = position.get('side')
+            algo_orders = self.get_open_algo_orders(symbol)
+            has_tp = False
+            has_sl = False
+            for o in algo_orders:
+                if o.get('posSide') == pos_side:
+                    if o.get('tpTriggerPx') is not None:
+                        has_tp = True
+                    if o.get('slTriggerPx') is not None:
+                        has_sl = True
+            if has_tp and has_sl:
+                logger.info(f"🧷 {symbol} 持仓已存在TP/SL条件单（posSide={pos_side}）")
+                return
+            self.place_tp_sl_orders(symbol, position)
+        except Exception as e:
+            logger.error(f"❌ 确保{symbol}持仓保护失败: {e}")
+
     def cancel_all_orders(self, symbol: str) -> bool:
         """取消所有未成交订单"""
         try:
@@ -463,6 +556,11 @@ class MACDStrategy:
                 logger.warning(f"⚠️ 检测到{symbol}已有持仓: {position['side']} {position['size']:.6f} @{position['entry_price']:.4f} PNL:{position['unrealized_pnl']:.2f}U")
                 # 记录已有持仓状态
                 self.last_position_state[symbol] = position['side']
+                # 确保该持仓已挂保护性条件单
+                try:
+                    self.ensure_position_protection(symbol)
+                except Exception as _e:
+                    logger.error(f"❌ 为{symbol}补挂TP/SL失败: {_e}")
             
             # 检查挂单
             orders = self.get_open_orders(symbol)
@@ -471,6 +569,21 @@ class MACDStrategy:
                 logger.warning(f"⚠️ 检测到{symbol}有{len(orders)}个未成交订单")
                 for order in orders:
                     logger.info(f"   └─ {order['side']} {order['amount']:.6f} @{order.get('price', 'market')} ID:{order['id']}")
+            # 检查条件单（TP/SL）
+            try:
+                algo_orders = self.get_open_algo_orders(symbol)
+                if algo_orders:
+                    has_orders = True
+                    logger.warning(f"⚠️ 检测到{symbol}有{len(algo_orders)}个条件单（TP/SL）未触发")
+                    for o in algo_orders:
+                        tips = []
+                        if o.get('tpTriggerPx') is not None:
+                            tips.append(f"TP@{o['tpTriggerPx']:.6f}")
+                        if o.get('slTriggerPx') is not None:
+                            tips.append(f"SL@{o['slTriggerPx']:.6f}")
+                        logger.info(f"   └─ posSide={o.get('posSide')} size={o.get('sz', 0):.6f} {' '.join(tips)}")
+            except Exception as _e:
+                logger.error(f"❌ 读取{symbol}条件单失败: {_e}")
         
         if has_positions or has_orders:
             logger.info("=" * 70)
@@ -871,7 +984,12 @@ class MACDStrategy:
 
             if order_id:
                 time.sleep(2)
+                # 刷新持仓并挂出保护性条件单（TP/SL）
                 self.get_position(symbol, force_refresh=True)
+                try:
+                    self.ensure_position_protection(symbol)
+                except Exception as _e:
+                    logger.error(f"❌ 挂出{symbol}保护性条件单失败: {_e}")
                 return True
 
             # 若三次都失败，抛出最后错误提示
