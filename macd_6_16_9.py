@@ -421,6 +421,7 @@ class MACDStrategy:
                 tp_px = max(0.0, entry - tp_mult * atr)
 
             inst_id = self.symbol_to_inst_id(symbol)
+            order_side = 'sell' if side == 'long' else 'buy'
             raw = {
                 'instId': inst_id,
                 'tdMode': 'cross',
