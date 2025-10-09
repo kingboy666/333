@@ -377,7 +377,7 @@ class MACDStrategy:
         """获取未触发的条件单（TP/SL）"""
         try:
             inst_id = self.symbol_to_inst_id(symbol)
-            resp = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id, 'ordType': 'conditional'})
+            resp = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id})
             data = resp.get('data') if isinstance(resp, dict) else resp
             results = []
             for o in (data or []):
@@ -393,7 +393,7 @@ class MACDStrategy:
             logger.error(f"❌ 获取{symbol}条件单失败: {e}")
             return []
 
-    def place_tp_sl_orders(self, symbol: str, position: Dict) -> bool:
+    def place_tp_sl_orders(self, symbol: str, position: Dict, place_tp: bool = True, place_sl: bool = True) -> bool:
         """为当前持仓挂条件单TP/SL（市价触发，reduceOnly）"""
         try:
             if position.get('size', 0) <= 0:
@@ -422,26 +422,41 @@ class MACDStrategy:
 
             inst_id = self.symbol_to_inst_id(symbol)
             order_side = 'sell' if side == 'long' else 'buy'
+            # 基础参数
             raw = {
                 'instId': inst_id,
                 'tdMode': 'cross',
                 'posSide': pos_side,
                 'side': order_side,
                 'ordType': 'conditional',
-                'tpTriggerPx': f"{tp_px:.8f}",
-                'tpOrdPx': '-1',
-                'tpTriggerPxType': 'last',
-                'slTriggerPx': f"{sl_px:.8f}",
-                'slOrdPx': '-1',
-                'slTriggerPxType': 'last',
                 'sz': str(size),
             }
+            # 只补缺失的一侧
+            if place_tp:
+                raw.update({
+                    'tpTriggerPx': f"{tp_px:.8f}",
+                    'tpOrdPx': '-1',
+                    'tpTriggerPxType': 'last',
+                })
+            if place_sl:
+                raw.update({
+                    'slTriggerPx': f"{sl_px:.8f}",
+                    'slOrdPx': '-1',
+                    'slTriggerPxType': 'last',
+                })
+            # 若两侧都不需要补，则无需下单
+            if not place_tp and not place_sl:
+                return True
+
             resp = self.exchange.privatePostTradeOrderAlgo(raw)
             ok = isinstance(resp, dict)
             if ok:
-                logger.info(f"🛡️ 已为{symbol}挂出TP/SL条件单 | TP@{tp_px:.6f} SL@{sl_px:.6f} | size={size:.6f}")
+                tp_msg = f"TP@{tp_px:.6f}" if place_tp else ""
+                sl_msg = f"SL@{sl_px:.6f}" if place_sl else ""
+                join = " " if (tp_msg and sl_msg) else ""
+                logger.info(f"🛡️ 已为{symbol}挂出条件单 | {tp_msg}{join}{sl_msg} | size={size:.6f}")
             else:
-                logger.warning(f"⚠️ 挂出{symbol} TP/SL条件单返回异常: {resp}")
+                logger.warning(f"⚠️ 挂出{symbol} 条件单返回异常: {resp}")
             return ok
         except Exception as e:
             logger.error(f"❌ 挂{symbol} TP/SL条件单失败: {e}")
@@ -453,20 +468,58 @@ class MACDStrategy:
             position = self.get_position(symbol, force_refresh=True)
             if position.get('size', 0) <= 0:
                 return
-            pos_side = position.get('side')
+
+            # 归一化持仓方向
+            pos_side = (position.get('side') or position.get('posSide') or '').lower()
+
+            # 去抖动：刚挂完单后短时间内不重复挂，避免接口延迟导致重复
+            if not hasattr(self, '_algo_guard'):
+                self._algo_guard = {}
+            key = (symbol, pos_side)
+            now = time.time()
+            last = self._algo_guard.get(key)
+            if last and (now - last) < 30:
+                return
+
             algo_orders = self.get_open_algo_orders(symbol)
             has_tp = False
             has_sl = False
+
             for o in algo_orders:
-                if o.get('posSide') == pos_side:
-                    if o.get('tpTriggerPx') is not None:
-                        has_tp = True
-                    if o.get('slTriggerPx') is not None:
-                        has_sl = True
+                try:
+                    o_pos = (o.get('posSide') or '').lower()
+                    tp = o.get('tpTriggerPx')
+                    sl = o.get('slTriggerPx')
+
+                    def _ok(v):
+                        if v in (None, '', '0', 0):
+                            return False
+                        try:
+                            return float(v) > 0
+                        except Exception:
+                            return True  # 有值但无法解析，也视为已设置
+
+                    # posSide 匹配或未提供时都计入，避免因为posSide不一致漏检
+                    if o_pos in ('', pos_side):
+                        if _ok(tp):
+                            has_tp = True
+                        if _ok(sl):
+                            has_sl = True
+                except Exception:
+                    continue
+
             if has_tp and has_sl:
                 logger.info(f"🧷 {symbol} 持仓已存在TP/SL条件单（posSide={pos_side}）")
                 return
-            self.place_tp_sl_orders(symbol, position)
+
+            placed = self.place_tp_sl_orders(
+                symbol,
+                position,
+                place_tp=(not has_tp),
+                place_sl=(not has_sl),
+            )
+            if placed:
+                self._algo_guard[key] = now
         except Exception as e:
             logger.error(f"❌ 确保{symbol}持仓保护失败: {e}")
 
