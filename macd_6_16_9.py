@@ -261,7 +261,7 @@ class MACDStrategy:
                 try:
                     lev = self.symbol_leverage.get(symbol, 20)
                     inst_id = self.symbol_to_inst_id(symbol)
-            order_side = 'sell' if side == 'long' else 'buy'
+
                     # 分别设置多空两边的杠杆
                     try:
                         self.exchange.privatePostAccountSetLeverage({'instId': inst_id, 'lever': str(lev), 'mgnMode': 'cross', 'posSide': 'long'})
