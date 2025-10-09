@@ -189,12 +189,12 @@ class MACDStrategy:
         # 结构：{ symbol: {'active': bool, 'peak': float, 'trough': float} }
         self.trailing_state: Dict[str, Dict[str, Any]] = {}
         
-        # 杠杆配置 - 分币种设置
+        # 杠杆配置 - 分币种设置（按需逐币设置）
         self.symbol_leverage: Dict[str, int] = {
-            'FIL/USDT:USDT': 30,
-            'WIF/USDT:USDT': 30,
-            'WLD/USDT:USDT': 30,
-            'ZRO/USDT:USDT': 20,
+            'BTC/USDT:USDT': 25,
+            'ETH/USDT:USDT': 30,
+            'SOL/USDT:USDT': 30,
+            'DOGE/USDT:USDT': 15,
         }
         
         # 仓位配置 - 使用100%资金
@@ -376,7 +376,7 @@ class MACDStrategy:
         """获取未触发的条件单（TP/SL）"""
         try:
             inst_id = self.symbol_to_inst_id(symbol)
-            resp = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id})
+            resp = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id, 'ordType': 'conditional'})
             data = resp.get('data') if isinstance(resp, dict) else resp
             results = []
             for o in (data or []):
@@ -425,10 +425,12 @@ class MACDStrategy:
                 'tdMode': 'cross',
                 'posSide': pos_side,
                 'reduceOnly': True,
+                'ordType': 'conditional',
                 'tpTriggerPx': f"{tp_px:.8f}",
                 'tpOrdPx': '-1',
                 'slTriggerPx': f"{sl_px:.8f}",
                 'slOrdPx': '-1',
+                'triggerPxType': 'last',
                 'sz': str(size),
             }
             resp = self.exchange.privatePostTradeOrderAlgo(raw)
