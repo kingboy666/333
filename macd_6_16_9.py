@@ -379,8 +379,15 @@ class MACDStrategy:
             if not hasattr(self, 'single_algo_tp_sl'):
                 self.single_algo_tp_sl = True
             inst_id = self.symbol_to_inst_id(symbol)
-            resp = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id, 'ordType': 'conditional'})
-            data = resp.get('data') if isinstance(resp, dict) else resp
+            resp_cond = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id, 'ordType': 'conditional'})
+            data_cond = resp_cond.get('data') if isinstance(resp_cond, dict) else resp_cond
+            # 兼容 OCO 组合条件单
+            try:
+                resp_oco = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id, 'ordType': 'oco'})
+                data_oco = resp_oco.get('data') if isinstance(resp_oco, dict) else resp_oco
+            except Exception:
+                data_oco = []
+            data = (data_cond or []) + (data_oco or [])
             results = []
             for o in (data or []):
                 results.append({
@@ -411,6 +418,20 @@ class MACDStrategy:
 
             side = position.get('side')
             size = float(position.get('size', 0) or 0)
+            # 将 size 对齐到合约步进（lotSz 的整数倍）；至少为一档，避免被拒或静默丢弃
+            lot_sz = self.markets_info.get(symbol, {}).get('lot_size')
+            try:
+                if lot_sz:
+                    lot_sz = float(lot_sz)
+                    if lot_sz > 0:
+                        steps = max(1, int(size / lot_sz))
+                        size = steps * lot_sz
+            except Exception:
+                pass
+            # 规范化 sz 字符串，避免科学计数
+            def _fmt_sz(v: float) -> str:
+                return ('{0:.8f}'.format(v)).rstrip('0').rstrip('.') if v > 0 else '0'
+            size_str = _fmt_sz(size)
             pos_side = 'long' if side == 'long' else 'short'
             sl_mult = float(params['sl_mult'])
             tp_mult = float(params['tp_mult'])
@@ -437,15 +458,22 @@ class MACDStrategy:
                 'side': order_side,
                 'ordType': 'conditional',
                 'reduceOnly': 'true',
-                'sz': str(size),
+                'sz': size_str,
             }
 
             def _post(payload, action_label):
                 resp = self.exchange.privatePostTradeOrderAlgo(payload)
                 code = str(resp.get('code')) if isinstance(resp, dict) and 'code' in resp else None
+                msg = resp.get('msg') if isinstance(resp, dict) else None
+                data = resp.get('data') if isinstance(resp, dict) else None
+                algo_ids = []
+                if isinstance(data, list):
+                    for it in data:
+                        aid = it.get('algoId') or it.get('ordId') or it.get('clOrdId')
+                        if aid:
+                            algo_ids.append(str(aid))
                 ok = (code == '0')
                 if not ok:
-                    # 仅打印关键字段以便排查（不打印全量避免冗长）
                     brief = {
                         'instId': payload.get('instId'),
                         'posSide': payload.get('posSide'),
@@ -455,9 +483,9 @@ class MACDStrategy:
                         'slTriggerPx': payload.get('slTriggerPx'),
                         'sz': payload.get('sz'),
                     }
-                    logger.warning(f"⚠️ {action_label} 条件单返回异常 code={code} resp={resp} payload={brief}")
+                    logger.warning(f"⚠️ {action_label} 条件单返回异常 code={code} msg={msg} data={data} payload={brief}")
                 else:
-                    logger.info(f"✅ {action_label} 条件单提交成功 code={code}")
+                    logger.info(f"✅ {action_label} 条件单提交成功 code={code} algoIds={algo_ids}")
                 return ok, resp
 
             # 根据需要分别提交 TP 和 SL；若两者都需要，分两次提交更稳妥
@@ -471,6 +499,7 @@ class MACDStrategy:
                 # 组合提交优先；若 single_algo_tp_sl=True 则失败不拆分，避免生成两条
                 payload_both = dict(raw_base)
                 payload_both.update({
+                    'ordType': 'oco',          # 使用 OCO 组合单
                     'tpTriggerPx': f"{tp_px:.8f}",
                     'tpOrdPx': f"{tp_px:.8f}",  # TP 限价触发
                     'tpTriggerPxType': 'last',
@@ -480,7 +509,19 @@ class MACDStrategy:
                 })
                 ok_both, _ = _post(payload_both, 'TP+SL')
                 if ok_both:
-                    logger.info(f"🛡️ 已为{symbol}挂出组合条件单 | TP@{tp_px:.6f} SL@{sl_px:.6f} | size={size:.6f}")
+                    logger.info(f"🛡️ 已为{symbol}挂出组合条件单 | TP@{tp_px:.6f} SL@{sl_px:.6f} | size={size_str}")
+                    # 提交后短暂等待再复查，确认两侧都存在
+                    try:
+                        time.sleep(2)
+                        chk = self.get_open_algo_orders(symbol)
+                        found_tp = any((o.get('posSide') or '').lower() == pos_side and (o.get('tpTriggerPx') or 0) for o in chk)
+                        found_sl = any((o.get('posSide') or '').lower() == pos_side and (o.get('slTriggerPx') or 0) for o in chk)
+                        if found_tp and found_sl:
+                            logger.info(f"🔍 复查确认 {symbol}({pos_side}) 组合条件单两侧均已存在")
+                        else:
+                            logger.warning(f"🔍 复查仅发现 {('TP' if found_tp else '')}{(' ' if found_tp and not found_sl else '')}{('SL' if found_sl else '')}，可能有一侧未被创建")
+                    except Exception:
+                        pass
                     return True
 
                 if getattr(self, 'single_algo_tp_sl', True):
