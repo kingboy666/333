@@ -419,45 +419,133 @@ class MACDStrategy:
             else:
                 sl_px = entry + sl_mult * atr
                 tp_px = max(0.0, entry - tp_mult * atr)
+            # 按合约价格精度进行四舍五入，避免因精度被拒
+            px_prec = int(self.markets_info.get(symbol, {}).get('price_precision', 4))
+            sl_px = round(sl_px, px_prec)
+            tp_px = round(tp_px, px_prec)
 
             inst_id = self.symbol_to_inst_id(symbol)
             order_side = 'sell' if side == 'long' else 'buy'
-            # 基础参数
-            raw = {
+
+            # 基础参数 + reduceOnly，避免开反向仓位
+            raw_base = {
                 'instId': inst_id,
                 'tdMode': 'cross',
                 'posSide': pos_side,
                 'side': order_side,
                 'ordType': 'conditional',
+                'reduceOnly': 'true',
                 'sz': str(size),
             }
-            # 只补缺失的一侧
-            if place_tp:
-                raw.update({
+
+            def _post(payload, action_label):
+                resp = self.exchange.privatePostTradeOrderAlgo(payload)
+                code = str(resp.get('code')) if isinstance(resp, dict) and 'code' in resp else None
+                ok = (code == '0')
+                if not ok:
+                    # 仅打印关键字段以便排查（不打印全量避免冗长）
+                    brief = {
+                        'instId': payload.get('instId'),
+                        'posSide': payload.get('posSide'),
+                        'side': payload.get('side'),
+                        'ordType': payload.get('ordType'),
+                        'tpTriggerPx': payload.get('tpTriggerPx'),
+                        'slTriggerPx': payload.get('slTriggerPx'),
+                        'sz': payload.get('sz'),
+                    }
+                    logger.warning(f"⚠️ {action_label} 条件单返回异常 code={code} resp={resp} payload={brief}")
+                else:
+                    logger.info(f"✅ {action_label} 条件单提交成功 code={code}")
+                return ok, resp
+
+            # 根据需要分别提交 TP 和 SL；若两者都需要，分两次提交更稳妥
+            if not place_tp and not place_sl:
+                return True
+
+            ok_all = True
+            messages = []
+
+            if place_tp and place_sl:
+                # 先尝试合并提交；若失败则回退为分开提交
+                payload_both = dict(raw_base)
+                payload_both.update({
                     'tpTriggerPx': f"{tp_px:.8f}",
                     'tpOrdPx': '-1',
                     'tpTriggerPxType': 'last',
-                })
-            if place_sl:
-                raw.update({
                     'slTriggerPx': f"{sl_px:.8f}",
                     'slOrdPx': '-1',
                     'slTriggerPxType': 'last',
                 })
-            # 若两侧都不需要补，则无需下单
-            if not place_tp and not place_sl:
-                return True
+                ok_both, _ = _post(payload_both, 'TP+SL')
+                if ok_both:
+                    logger.info(f"🛡️ 已为{symbol}挂出条件单 | TP@{tp_px:.6f} SL@{sl_px:.6f} | size={size:.6f}")
+                    return True
+                # 回退：分别提交
+                payload_tp = dict(raw_base)
+                payload_tp.update({
+                    'tpTriggerPx': f"{tp_px:.8f}",
+                    'tpOrdPx': '-1',
+                    'tpTriggerPxType': 'last',
+                })
+                ok_tp, _ = _post(payload_tp, 'TP')
+                if not ok_tp:
+                    payload_tp_limit = dict(payload_tp)
+                    payload_tp_limit['tpOrdPx'] = payload_tp_limit.get('tpTriggerPx')
+                    ok_tp, _ = _post(payload_tp_limit, 'TP(limit-retry)')
+                ok_all = ok_all and ok_tp
+                if ok_tp:
+                    messages.append(f"TP@{tp_px:.6f}")
 
-            resp = self.exchange.privatePostTradeOrderAlgo(raw)
-            ok = isinstance(resp, dict)
-            if ok:
-                tp_msg = f"TP@{tp_px:.6f}" if place_tp else ""
-                sl_msg = f"SL@{sl_px:.6f}" if place_sl else ""
-                join = " " if (tp_msg and sl_msg) else ""
-                logger.info(f"🛡️ 已为{symbol}挂出条件单 | {tp_msg}{join}{sl_msg} | size={size:.6f}")
-            else:
-                logger.warning(f"⚠️ 挂出{symbol} 条件单返回异常: {resp}")
-            return ok
+                payload_sl = dict(raw_base)
+                payload_sl.update({
+                    'slTriggerPx': f"{sl_px:.8f}",
+                    'slOrdPx': '-1',
+                    'slTriggerPxType': 'last',
+                })
+                ok_sl, _ = _post(payload_sl, 'SL')
+                if not ok_sl:
+                    payload_sl_limit = dict(payload_sl)
+                    payload_sl_limit['slOrdPx'] = payload_sl_limit.get('slTriggerPx')
+                    ok_sl, _ = _post(payload_sl_limit, 'SL(limit-retry)')
+                ok_all = ok_all and ok_sl
+                if ok_sl:
+                    messages.append(f"SL@{sl_px:.6f}")
+
+                if messages:
+                    logger.info(f"🛡️ 已为{symbol}挂出条件单 | {' '.join(messages)} | size={size:.6f}")
+                return ok_all
+
+            if place_tp:
+                payload_tp = dict(raw_base)
+                payload_tp.update({
+                    'tpTriggerPx': f"{tp_px:.8f}",
+                    'tpOrdPx': '-1',
+                    'tpTriggerPxType': 'last',
+                })
+                ok_tp, _ = _post(payload_tp, 'TP')
+                if not ok_tp:
+                    payload_tp_limit = dict(payload_tp)
+                    payload_tp_limit['tpOrdPx'] = payload_tp_limit.get('tpTriggerPx')
+                    ok_tp, _ = _post(payload_tp_limit, 'TP(limit-retry)')
+                if ok_tp:
+                    logger.info(f"🛡️ 已为{symbol}挂出条件单 | TP@{tp_px:.6f} | size={size:.6f}")
+                return ok_tp
+
+            if place_sl:
+                payload_sl = dict(raw_base)
+                payload_sl.update({
+                    'slTriggerPx': f"{sl_px:.8f}",
+                    'slOrdPx': '-1',
+                    'slTriggerPxType': 'last',
+                })
+                ok_sl, _ = _post(payload_sl, 'SL')
+                if not ok_sl:
+                    payload_sl_limit = dict(payload_sl)
+                    payload_sl_limit['slOrdPx'] = payload_sl_limit.get('slTriggerPx')
+                    ok_sl, _ = _post(payload_sl_limit, 'SL(limit-retry)')
+                if ok_sl:
+                    logger.info(f"🛡️ 已为{symbol}挂出条件单 | SL@{sl_px:.6f} | size={size:.6f}")
+                return ok_sl
         except Exception as e:
             logger.error(f"❌ 挂{symbol} TP/SL条件单失败: {e}")
             return False
@@ -478,7 +566,7 @@ class MACDStrategy:
             key = (symbol, pos_side)
             now = time.time()
             last = self._algo_guard.get(key)
-            if last and (now - last) < 30:
+            if last and (now - last) < 65:
                 return
 
             algo_orders = self.get_open_algo_orders(symbol)
