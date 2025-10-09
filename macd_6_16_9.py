@@ -424,13 +424,13 @@ class MACDStrategy:
                 'instId': inst_id,
                 'tdMode': 'cross',
                 'posSide': pos_side,
-                'reduceOnly': True,
                 'ordType': 'conditional',
                 'tpTriggerPx': f"{tp_px:.8f}",
                 'tpOrdPx': '-1',
+                'tpTriggerPxType': 'last',
                 'slTriggerPx': f"{sl_px:.8f}",
                 'slOrdPx': '-1',
-                'triggerPxType': 'last',
+                'slTriggerPxType': 'last',
                 'sz': str(size),
             }
             resp = self.exchange.privatePostTradeOrderAlgo(raw)
