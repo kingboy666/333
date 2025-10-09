@@ -377,7 +377,7 @@ class MACDStrategy:
         """获取未触发的条件单（TP/SL）"""
         try:
             inst_id = self.symbol_to_inst_id(symbol)
-            resp = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id})
+            resp = self.exchange.privateGetTradeOrdersAlgoPending({'instType': 'SWAP', 'instId': inst_id, 'ordType': 'conditional'})
             data = resp.get('data') if isinstance(resp, dict) else resp
             results = []
             for o in (data or []):
