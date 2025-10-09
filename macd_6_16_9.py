@@ -261,6 +261,7 @@ class MACDStrategy:
                 try:
                     lev = self.symbol_leverage.get(symbol, 20)
                     inst_id = self.symbol_to_inst_id(symbol)
+            order_side = 'sell' if side == 'long' else 'buy'
                     # 分别设置多空两边的杠杆
                     try:
                         self.exchange.privatePostAccountSetLeverage({'instId': inst_id, 'lever': str(lev), 'mgnMode': 'cross', 'posSide': 'long'})
@@ -424,6 +425,7 @@ class MACDStrategy:
                 'instId': inst_id,
                 'tdMode': 'cross',
                 'posSide': pos_side,
+                'side': order_side,
                 'ordType': 'conditional',
                 'tpTriggerPx': f"{tp_px:.8f}",
                 'tpOrdPx': '-1',
@@ -1414,6 +1416,13 @@ class MACDStrategy:
             
             # 显示当前持仓状态
             self.display_current_positions()
+            
+            # 在每轮开始时为已有持仓补挂/补全 TP/SL 条件单（启动前或外部形成的持仓也覆盖）
+            for symbol in self.symbols:
+                try:
+                    self.ensure_position_protection(symbol)
+                except Exception as _e:
+                    logger.error(f"❌ 为{symbol}补挂TP/SL失败: {_e}")
             
             logger.info("🔍 分析交易信号...")
             logger.info("-" * 70)
